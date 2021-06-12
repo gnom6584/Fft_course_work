@@ -8,6 +8,7 @@
 #include <cmath>
 #include "alias.h"
 #include "dft_16.h"
+#include "dft_16_simd.h"
 
 const auto img_i = Complex(0.0, 1.0);
 const auto i2pi = 2.0 * M_PI * img_i;
@@ -122,14 +123,13 @@ inline void fft_2(const std::vector<Complex>& f, std::vector<Complex>& x, const 
         x[k + offset + N_2] = x_even  + x_odd * exps[(k + N_2) * depth];
     }
 }
-
 inline void fft_3(const std::vector<Complex>& f, std::vector<Complex>& x, const std::vector<Complex>& exps,
     unsigned int N,
     unsigned int depth,
     unsigned int odd,
     unsigned int offset) {
-
     if(N <= 16) {
+
         dft_16(f, x, depth, odd, offset);
         return;
     }
@@ -140,10 +140,208 @@ inline void fft_3(const std::vector<Complex>& f, std::vector<Complex>& x, const 
 
     for(auto k = 0u; k < N_2; ++k) {
         const auto x_even = x[k + offset];
-        const auto x_odd = x[k + N_2 + offset];
-        x[k + offset] = x_even  + x_odd * exps[k * depth];
-        x[k + offset + N_2] = x_even  + x_odd * exps[(k + N_2) * depth];
+        const auto x_odd = x[k + N_2 + offset] * exps[k * depth];
+        x[k + offset] = x_even + x_odd;
+        x[k + offset + N_2] = x_even  - x_odd;
     }
+}
+
+inline std::vector<Complex> compute_exp(size_t N) {
+    std::vector<Complex> exps;
+    exps.resize(N);
+    auto N_4 = N / 4;
+    auto N_2 = N_4 * 2;
+    auto N_3_4 = N_4 * 3;
+    for (auto k = 0ul; k < N_4; k++) {
+        auto e = std::exp(-i2pi * ((Real) k / N));
+        exps[k] = e;
+    }
+
+    for (auto k = N_4; k < N_2; k++) {
+        auto e = exps[k - N_2];
+        exps[k] = Complex(e.imag(), -e.real());
+    }
+
+    for (auto k = N_2; k < N_3_4; k++) {
+        auto e = exps[k - N_3_4];
+        exps[k] = Complex(-e.real(), -e.imag());
+    }
+
+    for (auto k = N_3_4; k < N; k++) {
+        auto e = exps[k - N_3_4];
+        exps[k] = Complex(-e.imag(), e.real());
+    }
+
+
+    return exps;
+}
+
+inline bool is_2_power(unsigned  int x) {
+    return x != 0 && !(x & (x - 1));
+}
+
+inline bool next_2_power(unsigned  int x) {
+    return pow(2, ceil(log(x)/log(2)));;
+}
+
+#include <tbb/parallel_for.h>
+inline std::vector<Complex> fft_4(const std::vector<Complex>& f) {
+    using namespace std;
+
+    const auto f_N = size(f);
+
+    if(f_N <= 16)
+        return dft(f);
+
+    vector<Complex> x;
+    x.reserve(f_N);
+
+    auto exps = vector<Complex>();
+    const auto f_N_2 = f_N / 2;
+    exps.reserve(f_N_2);
+
+    for (int k = 0; k < f_N_2; ++k)
+        exps[k] = exp(-i2pi * ((Real) k / f_N));
+
+    auto d = 1;
+    vector<int> indices(1, 0);
+    while (d < f_N / 16) {
+        auto new_indices = vector<int>(d);
+        for (int i = 0; i < d; i += 2) {
+            new_indices[i] = indices[i / 2];
+            new_indices[i + 1] = new_indices[i] + d;
+        }
+        indices = new_indices;
+        d *= 2;
+    }
+
+    auto d_2 = d / 2;
+
+    tbb::parallel_for( tbb::blocked_range<unsigned int>(0, d),
+        [&](tbb::blocked_range<unsigned int> range)
+    {
+        for(auto i = std::begin(range); i < std::end(range); ++i)
+            dft_16_simd(f, x, d, indices[i % d_2] + i / d_2, i * 16);
+    });
+
+    d = d_2;
+    for (auto off_cof = 32; d >= 1; d /= 2, off_cof *= 2) {
+        tbb::parallel_for( tbb::blocked_range<unsigned int>(0, d),
+            [&](tbb::blocked_range<unsigned int> range) {
+                for(auto i = std::begin(range); i < std::end(range); ++i) {
+                    const auto N = f_N / d;
+                    const auto N_2 = N / 2;
+                    const auto offset = i * off_cof;
+                    for (auto k = 0u; k < N_2; k += 4) {
+                        auto k_1 = k + 1;
+                        auto k_2 = k + 2;
+                        auto k_3 = k + 3;
+                        auto k_offset = k + offset;
+                        auto k_offset_1 = k_offset + 1;
+                        auto k_offset_2 = k_offset + 2;
+                        auto k_offset_3 = k_offset + 3;
+                        auto k_N_2 = k + N_2;
+                        auto k_N_2_offset = k_N_2 + offset;
+                        auto k_N_2_offset_1 = k_N_2_offset + 1;
+                        auto k_N_2_offset_2 = k_N_2_offset + 2;
+                        auto k_N_2_offset_3 = k_N_2_offset + 3;
+
+                        double r_even_a[4] = {x[k + offset].real(), x[k_offset_1].real(), x[k_offset_2].real(), x[k_offset_3].real()};
+                        double i_even_a[4] = {x[k + offset].imag(), x[k_offset_1].imag(), x[k_offset_2].imag(), x[k_offset_3].imag()};
+                        double r_odd_a[4] = {x[k_N_2_offset].real(), x[k_N_2_offset_1].real(), x[k_N_2_offset_2].real(), x[k_N_2_offset_3].real()};
+                        double i_odd_a[4] = {x[k_N_2_offset].imag(), x[k_N_2_offset_1].imag(), x[k_N_2_offset_2].imag(), x[k_N_2_offset_3].imag()};
+                        double r_exp_a[4] =  {exps[k * d].real(), exps[k_1 * d].real(), exps[k_2 * d].real(), exps[k_3 * d].real()};
+                        double i_exp_a[4] =  {exps[k * d].imag(), exps[k_1 * d].imag(), exps[k_2 * d].imag(), exps[k_3 * d].imag()};
+
+                        auto r_even_m = _mm256_load_pd(r_even_a);
+                        auto i_even_m = _mm256_load_pd(i_even_a);
+
+                        auto r_odd_m = _mm256_load_pd(r_odd_a);
+                        auto i_odd_m = _mm256_load_pd(i_odd_a);
+
+                        auto r_exp_m = _mm256_load_pd(r_exp_a);
+                        auto i_exp_m = _mm256_load_pd(i_exp_a);
+
+                        auto m_r = _mm256_sub_pd(_mm256_mul_pd(r_odd_m, r_exp_m), _mm256_mul_pd(i_odd_m, i_exp_m));
+                        auto m_i = _mm256_add_pd(_mm256_mul_pd(i_odd_m, r_exp_m), _mm256_mul_pd(r_odd_m, i_exp_m));
+
+                        _mm256_storeu_pd(r_even_a, _mm256_add_pd(r_even_m, m_r));
+                        _mm256_storeu_pd(i_even_a, _mm256_add_pd(i_even_m, m_i));
+                        _mm256_storeu_pd(r_odd_a, _mm256_sub_pd(r_even_m, m_r));
+                        _mm256_storeu_pd(i_odd_a, _mm256_sub_pd(i_even_m, m_i));
+
+                        x[k_offset] = Complex(r_even_a[0], i_even_a[0]);
+                        x[k_offset_1] = Complex(r_even_a[1], i_even_a[1]);
+                        x[k_offset_2] = Complex(r_even_a[2], i_even_a[2]);
+                        x[k_offset_3] = Complex(r_even_a[3], i_even_a[3]);
+                        x[k_N_2_offset] = Complex(r_odd_a[0], i_odd_a[0]);
+                        x[k_N_2_offset_1] = Complex(r_odd_a[1], i_odd_a[1]);
+                        x[k_N_2_offset_2] = Complex(r_odd_a[2], i_odd_a[2]);
+                        x[k_N_2_offset_3] = Complex(r_odd_a[3], i_odd_a[3]);
+                    }
+                }
+        });
+    }
+    return x;
+}
+
+inline std::vector<Complex> fft_5(const std::vector<Complex>& f) {
+    using namespace std;
+
+    const auto f_N = size(f);
+
+    if(f_N <= 16)
+        return dft(f);
+
+    vector<Complex> x;
+    x.reserve(f_N);
+
+    auto exps = vector<Complex>();
+    const auto f_N_2 = f_N / 2;
+    exps.reserve(f_N_2);
+
+    for (int k = 0; k < f_N_2; ++k)
+        exps[k] = exp(-i2pi * ((Real) k / f_N));
+
+    auto d = 1;
+    vector<int> indices(1, 0);
+    while (d < f_N / 16) {
+        auto new_indices = vector<int>(d);
+        for (int i = 0; i < d; i += 2) {
+            new_indices[i] = indices[i / 2];
+            new_indices[i + 1] = new_indices[i] + d;
+        }
+        indices = new_indices;
+        d *= 2;
+    }
+
+    auto d_2 = d / 2;
+
+    tbb::parallel_for( tbb::blocked_range<unsigned int>(0, d),
+        [&](tbb::blocked_range<unsigned int> range)
+        {
+            for(auto i = std::begin(range); i < std::end(range); ++i)
+                dft_16(f, x, d, indices[i % d_2] + i / d_2, i * 16);
+        });
+
+    d = d_2;
+    for (auto off_cof = 32; d >= 1; d /= 2, off_cof *= 2) {
+        tbb::parallel_for( tbb::blocked_range<unsigned int>(0, d),
+            [&](tbb::blocked_range<unsigned int> range) {
+                for(auto i = std::begin(range); i < std::end(range); ++i) {
+                    const auto N = f_N / d;
+                    const auto N_2 = N / 2;
+                    const auto offset = i * off_cof;
+                    for (auto k = 0u; k < N_2; k++) {
+                        const auto x_even = x[k + offset];
+                        const auto x_odd = x[k + N_2 + offset] * exps[k * d];
+                        x[k + offset] = x_even + x_odd;
+                        x[k + offset + N_2] = x_even  - x_odd;
+                    }
+                }
+            });
+    }
+    return x;
 }
 
 inline std::vector<Complex> i_fft(const std::vector<Complex>& f) {
@@ -173,30 +371,5 @@ inline std::vector<Complex> i_fft(const std::vector<Complex>& f) {
 
     return x;
 }
-
-
-
-const struct Operator {
-public:
-    enum {
-        Dft, I_Dft, Fft, I_Fft
-    };
-
-    explicit Operator(int type) noexcept : type(type) {}
-
-    std::vector<Complex> operator*
-        (const std::vector<Complex>& f) const {
-        switch (type) {
-            case Dft: return dft(f);
-            case I_Dft: return i_dft(f);
-            case Fft: return fft(f);
-            case I_Fft: return i_fft(f);
-        }
-        throw std::runtime_error("Invalid operator");
-    }
-private:
-    const int type;
-} Dft(Operator::Dft), I_Dft(Operator::I_Dft), Fft(Operator::Fft), I_Fft(Operator::I_Fft);
-
 
 #endif //FFT__DFT_H_
